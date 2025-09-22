@@ -52,14 +52,17 @@ class DDPM(BaseModel):
         # need to average in multi-gpu
 
         # l_tot = loss
-        l_pix, l_sim, l_smt, l_tot = loss
+        l_pix, l_pixel, l_ssim, l_smt, l_poly, l_landmark, l_tot = loss
         l_tot.backward()
         self.optG.step()
 
         # set log
         self.log_dict['l_pix'] = l_pix.item()
-        self.log_dict['l_sim'] = l_sim.item()
+        self.log_dict['l_pixel'] = l_pixel.item()
+        self.log_dict['l_ssim'] = l_ssim.item()
         self.log_dict['l_smt'] = l_smt.item()
+        self.log_dict['l_poly'] = l_poly.item()
+        self.log_dict['l_landmark'] = l_landmark.item()
         self.log_dict['l_tot'] = l_tot.item()
 
     def test_generation(self, continuous=False):

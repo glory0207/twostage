@@ -1,0 +1,11 @@
+# Python compiled files
+*.pyc
+__pycache__/
+
+# PyTorch models  
+*.pth
+
+# Images
+*.png
+*.jpg
+*.txt

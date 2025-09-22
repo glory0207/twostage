@@ -7,7 +7,7 @@ import core.logger as Logger
 import os
 from math import *
 import time
-from util.visualizer import Visualizer
+from util.visualizer_simple import Visualizer
 from PIL import Image
 import numpy as np
 

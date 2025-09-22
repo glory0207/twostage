@@ -101,6 +101,19 @@ class GaussianDiffusion(nn.Module):
             raise NotImplementedError()
         self.loss_ncc = loss.crossCorrelation2D(1, kernel=(9, 9)).to(device)
         self.loss_reg = loss.gradientLoss("l2").to(device)
+        # 添加地标点损失用于FIRE数据集
+        self.loss_landmark = loss.LandmarkLoss(device=device).to(device)
+        # 添加互信息损失作为备选
+        self.loss_mi = loss.MutualInformation2D(bins=32).to(device)
+        # 添加多项式流场正则化
+        self.loss_poly = loss.PolynomialFlowRegularizer(order=2).to(device)
+        # 添加带mask的NCC损失
+        self.loss_ncc_masked = loss.MaskedLoss(self.loss_ncc).to(device)
+        # 添加基于内容重叠区域的NCC损失
+        self.loss_ncc_overlap = loss.OverlapMaskedLoss(self.loss_ncc, threshold=0.1).to(device)
+        # 添加更适合局部区域的损失函数
+        self.loss_pixelwise = loss.PixelwiseLoss(loss_type='smooth_l1').to(device)
+        self.loss_ssim = loss.StructuralSimilarityLoss(window_size=11).to(device)
 
 
     def set_new_noise_schedule(self, schedule_opt, device):
@@ -276,11 +289,34 @@ class GaussianDiffusion(nn.Module):
         l_pix = self.loss_func(noise, x_recon)
 
         output, flow = self.field_fn(torch.cat([x_in['M'], x_recon], dim=1))
-        l_sim = self.loss_ncc(output, x_in['F']) * self.lambda_L
-        l_smt = self.loss_reg(flow) * self.lambda_L
-        loss = l_pix + l_sim + l_smt
+        
+        # 使用更适合局部区域的损失函数
+        eye_mask = x_in.get('mask', None)  # 获取眼球mask
+        
+        # 完全基于地标点的细配准损失函数
+        # 不使用图像相似性损失，避免干扰
+        l_pixel = torch.tensor(0.0, device=x_start.device)  # 关闭
+        l_ssim = torch.tensor(0.0, device=x_start.device)   # 关闭
+        l_sim = l_pixel + l_ssim  # 总相似性损失 = 0
+        
+        # 多项式流场正则化（鼓励全局二阶多项式变换）
+        l_poly = self.loss_poly(flow) * 0.1
+        
+        # 平滑正则化（防止过度变形，但权重较小）
+        l_smt = self.loss_reg(flow) * 0.05
+        
+        # 地标点损失（主要和唯一的监督信号）
+        l_landmark = torch.tensor(0.0, device=x_start.device)
+        if 'correspondences' in x_in and x_in['correspondences'].numel() > 0:
+            l_landmark = self.loss_landmark(flow, x_in['correspondences'], image_size=(h, w)) * self.lambda_L  # 标准权重
+        else:
+            # 如果没有地标点，给一个小的正则化损失避免训练崩溃
+            l_landmark = l_poly + l_smt
+        
+        # 总损失：主要是地标点损失 + 多项式正则化 + 少量平滑
+        loss = l_pix + l_landmark + l_poly + l_smt
 
-        return [x_recon, output, flow], [l_pix, l_sim, l_smt, loss]
+        return [x_recon, output, flow], [l_pix, l_pixel, l_ssim, l_smt, l_poly, l_landmark, loss]
 
     def forward(self, x, *args, **kwargs):
         return self.p_losses(x, *args, **kwargs)

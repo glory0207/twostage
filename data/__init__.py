@@ -21,10 +21,17 @@ def create_dataloader(dataset, dataset_opt, phase):
 
 def create_dataset_2D(dataset_opt, phase):
     '''create dataset'''
-    from data.RAFD_dataset import RAFDDataset as D
-    dataset = D(dataroot=dataset_opt['dataroot'],
-                split=phase
-                )
+    if dataset_opt.get('name', '').lower() == 'fire':
+        from data.FIRE_dataset import FIREDataset as D
+        dataset = D(dataroot=dataset_opt['dataroot'],
+                    split=dataset_opt.get('split', phase),
+                    stage1_output_dir=dataset_opt.get('stage1_output_dir', None)
+                    )
+    else:
+        from data.RAFD_dataset import RAFDDataset as D
+        dataset = D(dataroot=dataset_opt['dataroot'],
+                    split=phase
+                    )
     logger = logging.getLogger('base')
     logger.info('Dataset [{:s} - {:s}] is created.'.format(dataset.__class__.__name__,
                                                            dataset_opt['name']))
