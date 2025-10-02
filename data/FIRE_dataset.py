@@ -12,10 +12,13 @@ class FIREDataset(Dataset):
     FIRE数据集类 - 用于第二阶段细配准
     基于第一阶段（zidong.py）的粗配准结果进行细配准
     """
-    def __init__(self, dataroot, split='train', stage1_output_dir=None):
+    def __init__(self, dataroot, split='train', stage1_output_dir=None, 
+                 vessel_segmentation_dir=None, use_vessel_topology_loss=False):
         self.split = split
         self.dataroot = Path(dataroot)
         self.stage1_output_dir = Path(stage1_output_dir) if stage1_output_dir else None
+        self.vessel_segmentation_dir = Path(vessel_segmentation_dir) if vessel_segmentation_dir else None
+        self.use_vessel_topology_loss = use_vessel_topology_loss
         self.imageNum = []
         self.gt_correspondences = {}
         
@@ -258,6 +261,58 @@ class FIREDataset(Dataset):
         cv2.circle(mask, center, radius, 1, -1)
         return mask
     
+    def load_vessel_segmentation(self, pair_id, target_size):
+        """
+        加载血管分割结果
+        
+        Args:
+            pair_id: 图像对ID (例如 'A01', 'P01' 等)
+            target_size: 目标尺寸
+            
+        Returns:
+            vessel_seg_moving: 移动图像的血管分割 (tensor)
+            vessel_seg_fixed: 固定图像的血管分割 (tensor)
+        """
+        if not self.vessel_segmentation_dir or not self.vessel_segmentation_dir.exists():
+            return None, None
+        
+        try:
+            # 构建血管分割文件路径
+            # 移动图像对应配准后的图像分割
+            registered_seg_dir = self.vessel_segmentation_dir / "registered_segmentation"
+            vessel_moving_path = registered_seg_dir / f"{pair_id}_registered_segmentation.png"
+            
+            # 固定图像对应target图像分割
+            target_seg_dir = self.vessel_segmentation_dir / "target_segmentation"
+            vessel_fixed_path = target_seg_dir / f"{pair_id}_target_segmentation.png"
+            
+            vessel_seg_moving = None
+            vessel_seg_fixed = None
+            
+            # 加载移动图像血管分割
+            if vessel_moving_path.exists():
+                vessel_moving_img = cv2.imread(str(vessel_moving_path), cv2.IMREAD_GRAYSCALE)
+                if vessel_moving_img is not None:
+                    # Resize到目标尺寸
+                    vessel_moving_img = cv2.resize(vessel_moving_img, (target_size, target_size))
+                    # 归一化到[0,1]范围，添加batch和channel维度 (B, C, H, W)
+                    vessel_seg_moving = torch.from_numpy(vessel_moving_img / 255.0).float().unsqueeze(0)
+            
+            # 加载固定图像血管分割
+            if vessel_fixed_path.exists():
+                vessel_fixed_img = cv2.imread(str(vessel_fixed_path), cv2.IMREAD_GRAYSCALE)
+                if vessel_fixed_img is not None:
+                    # Resize到目标尺寸
+                    vessel_fixed_img = cv2.resize(vessel_fixed_img, (target_size, target_size))
+                    # 归一化到[0,1]范围，添加channel维度 (C, H, W)
+                    vessel_seg_fixed = torch.from_numpy(vessel_fixed_img / 255.0).float().unsqueeze(0)
+            
+            return vessel_seg_moving, vessel_seg_fixed
+            
+        except Exception as e:
+            print(f"Warning: Failed to load vessel segmentation for {pair_id}: {e}")
+            return None, None
+    
     def __len__(self):
         return self.data_len
     
@@ -374,5 +429,12 @@ class FIREDataset(Dataset):
         else:
             result['correspondences'] = torch.zeros(0, 4).float()
             result['correspondences_orig'] = torch.zeros(0, 4).float()
-            
+        
+        # 添加血管分割信息（如果启用了血管拓扑损失）
+        if self.use_vessel_topology_loss and self.vessel_segmentation_dir:
+            vessel_seg_moving, vessel_seg_fixed = self.load_vessel_segmentation(pair_id, target_size)
+            if vessel_seg_moving is not None and vessel_seg_fixed is not None:
+                result['vessel_seg_moving'] = vessel_seg_moving
+                result['vessel_seg_fixed'] = vessel_seg_fixed
+        
         return result

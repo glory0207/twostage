@@ -9,3 +9,7 @@ __pycache__/
 *.png
 *.jpg
 *.txt
+*.tif
+*.xlsx
+*.m
+*.mat

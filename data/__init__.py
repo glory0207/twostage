@@ -25,7 +25,9 @@ def create_dataset_2D(dataset_opt, phase):
         from data.FIRE_dataset import FIREDataset as D
         dataset = D(dataroot=dataset_opt['dataroot'],
                     split=dataset_opt.get('split', phase),
-                    stage1_output_dir=dataset_opt.get('stage1_output_dir', None)
+                    stage1_output_dir=dataset_opt.get('stage1_output_dir', None),
+                    vessel_segmentation_dir=dataset_opt.get('vessel_segmentation_dir', None),
+                    use_vessel_topology_loss=dataset_opt.get('use_vessel_topology_loss', False)
                     )
     else:
         from data.RAFD_dataset import RAFDDataset as D

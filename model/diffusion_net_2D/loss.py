@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from skimage.morphology import skeletonize
+import cv2
 
 
 class gradientLoss(nn.Module):
@@ -556,3 +558,342 @@ class MutualInformation2D(nn.Module):
                     mi += hist_2d[i, j] * np.log(hist_2d[i, j] / (px[i] * py[j]))
         
         return torch.tensor(mi, device=x.device)
+
+
+class CenterlineDiceLoss(nn.Module):
+    """
+    Centerline Dice (clDice) Loss for vessel segmentation topology preservation
+    
+    Based on the paper: "clDice - a novel topology-preserving loss function for tubular structure segmentation"
+    This loss combines regular Dice loss with centerline topology preservation.
+    """
+    def __init__(self, alpha=0.5, beta=0.5, smooth=1e-6):
+        """
+        Args:
+            alpha: Weight for regular Dice loss vs clDice loss
+            beta: Weight for precision vs recall in topology preservation  
+            smooth: Smoothing factor to avoid division by zero
+        """
+        super(CenterlineDiceLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+    
+    def forward(self, pred, target, apply_sigmoid=True):
+        """
+        Compute centerline Dice loss
+        
+        Args:
+            pred: Predicted segmentation (B, C, H, W) - logits or probabilities
+            target: Ground truth segmentation (B, C, H, W) - binary
+            apply_sigmoid: Whether to apply sigmoid to predictions
+            
+        Returns:
+            clDice loss value
+        """
+        if apply_sigmoid:
+            pred = torch.sigmoid(pred)
+        
+        # Ensure inputs are single channel
+        if pred.shape[1] > 1:
+            pred = torch.mean(pred, dim=1, keepdim=True)
+        if target.shape[1] > 1:
+            target = torch.mean(target, dim=1, keepdim=True)
+        
+        batch_size = pred.shape[0]
+        total_loss = 0.0
+        
+        for b in range(batch_size):
+            # Extract single batch
+            pred_b = pred[b, 0].detach().cpu().numpy()
+            target_b = target[b, 0].detach().cpu().numpy()
+            
+            # Binarize predictions
+            pred_binary = (pred_b > 0.5).astype(np.uint8)
+            target_binary = (target_b > 0.5).astype(np.uint8)
+            
+            # Compute regular Dice loss
+            dice_loss = self._compute_dice_loss(
+                pred[b:b+1, 0:1], 
+                target[b:b+1, 0:1]
+            )
+            
+            # Compute centerline Dice loss
+            cl_dice_loss = self._compute_cl_dice_loss(pred_binary, target_binary)
+            
+            # Combined loss
+            total_loss += self.alpha * dice_loss + (1 - self.alpha) * cl_dice_loss
+        
+        return total_loss / batch_size
+    
+    def _compute_dice_loss(self, pred, target):
+        """Compute standard Dice loss"""
+        intersection = torch.sum(pred * target)
+        union = torch.sum(pred) + torch.sum(target)
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice
+    
+    def _compute_cl_dice_loss(self, pred_binary, target_binary):
+        """Compute centerline Dice loss"""
+        # Extract centerlines using skeletonization
+        pred_skeleton = self._extract_centerline(pred_binary)
+        target_skeleton = self._extract_centerline(target_binary)
+        
+        # Convert back to tensors
+        pred_skel_tensor = torch.tensor(pred_skeleton, dtype=torch.float32)
+        target_skel_tensor = torch.tensor(target_skeleton, dtype=torch.float32)
+        pred_tensor = torch.tensor(pred_binary, dtype=torch.float32)
+        target_tensor = torch.tensor(target_binary, dtype=torch.float32)
+        
+        # Compute topology precision and recall
+        tprec = self._compute_topology_precision(pred_skel_tensor, target_tensor)
+        trecall = self._compute_topology_recall(target_skel_tensor, pred_tensor)
+        
+        # Compute clDice following the formula in the image
+        # clDice = 1 - 2 * (tprec * trecall) / (tprec + trecall)
+        if tprec + trecall < self.smooth:
+            return torch.tensor(1.0)  # Maximum loss when no valid centerlines
+        
+        cl_dice = (2. * tprec * trecall + self.smooth) / (tprec + trecall + self.smooth)
+        return 1 - cl_dice
+    
+    def _extract_centerline(self, binary_mask):
+        """
+        Extract centerline from binary mask using skeletonization
+        
+        Args:
+            binary_mask: Binary segmentation mask (H, W)
+            
+        Returns:
+            centerline: Binary centerline mask (H, W)
+        """
+        if np.sum(binary_mask) == 0:
+            return binary_mask
+        
+        # Apply morphological operations to clean up the mask
+        kernel = np.ones((3,3), np.uint8)
+        cleaned_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_OPEN, kernel)
+        
+        # Extract skeleton
+        skeleton = skeletonize(cleaned_mask).astype(np.uint8)
+        
+        # Remove small isolated components
+        skeleton = self._remove_small_components(skeleton, min_size=3)
+        
+        return skeleton
+    
+    def _remove_small_components(self, binary_mask, min_size=3):
+        """Remove small connected components from binary mask"""
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
+        
+        # Keep only components larger than min_size
+        cleaned_mask = np.zeros_like(binary_mask)
+        for i in range(1, num_labels):  # Skip background (label 0)
+            if stats[i, cv2.CC_STAT_AREA] >= min_size:
+                cleaned_mask[labels == i] = 1
+        
+        return cleaned_mask
+    
+    def _compute_topology_precision(self, pred_centerline, target_segmentation):
+        """
+        Compute topology precision: how much of predicted centerline overlaps with target segmentation
+        
+        Args:
+            pred_centerline: Predicted centerline (H, W)
+            target_segmentation: Target segmentation (H, W)
+            
+        Returns:
+            Topology precision value
+        """
+        intersection = torch.sum(pred_centerline * target_segmentation)
+        pred_centerline_sum = torch.sum(pred_centerline)
+        
+        if pred_centerline_sum < self.smooth:
+            return torch.tensor(1.0)  # Perfect precision if no predicted centerline
+        
+        return intersection / (pred_centerline_sum + self.smooth)
+    
+    def _compute_topology_recall(self, target_centerline, pred_segmentation):
+        """
+        Compute topology recall: how much of target centerline is covered by predicted segmentation
+        
+        Args:
+            target_centerline: Target centerline (H, W)
+            pred_segmentation: Predicted segmentation (H, W)
+            
+        Returns:
+            Topology recall value
+        """
+        intersection = torch.sum(target_centerline * pred_segmentation)
+        target_centerline_sum = torch.sum(target_centerline)
+        
+        if target_centerline_sum < self.smooth:
+            return torch.tensor(1.0)  # Perfect recall if no target centerline
+        
+        return intersection / (target_centerline_sum + self.smooth)
+
+
+class VesselTopologyLoss(nn.Module):
+    """
+    Comprehensive vessel topology preservation loss that combines:
+    1. Centerline Dice (clDice) Loss
+    2. Connectivity preservation
+    3. Branching point preservation
+    """
+    def __init__(self, w_dice=0.4, w_cldice=0.4, w_connectivity=0.1, w_branching=0.1):
+        """
+        Args:
+            w_dice: Weight for standard Dice loss
+            w_cldice: Weight for centerline Dice loss
+            w_connectivity: Weight for connectivity preservation
+            w_branching: Weight for branching point preservation
+        """
+        super(VesselTopologyLoss, self).__init__()
+        self.w_dice = w_dice
+        self.w_cldice = w_cldice
+        self.w_connectivity = w_connectivity
+        self.w_branching = w_branching
+        
+        self.cldice_loss = CenterlineDiceLoss(alpha=1.0)  # Pure clDice, no regular Dice here
+        self.smooth = 1e-6
+    
+    def forward(self, pred, target, apply_sigmoid=True):
+        """
+        Compute comprehensive vessel topology loss
+        
+        Args:
+            pred: Predicted segmentation (B, C, H, W)
+            target: Ground truth segmentation (B, C, H, W)
+            apply_sigmoid: Whether to apply sigmoid to predictions
+            
+        Returns:
+            Combined topology loss
+        """
+        if apply_sigmoid:
+            pred_prob = torch.sigmoid(pred)
+        else:
+            pred_prob = pred
+        
+        # Ensure single channel
+        if pred_prob.shape[1] > 1:
+            pred_prob = torch.mean(pred_prob, dim=1, keepdim=True)
+        if target.shape[1] > 1:
+            target = torch.mean(target, dim=1, keepdim=True)
+        
+        # 1. Standard Dice loss
+        dice_loss = self._compute_dice_loss(pred_prob, target)
+        
+        # 2. Centerline Dice loss
+        cldice_loss = self.cldice_loss(pred, target, apply_sigmoid=apply_sigmoid)
+        
+        # 3. Connectivity preservation loss
+        connectivity_loss = self._compute_connectivity_loss(pred_prob, target)
+        
+        # 4. Branching point preservation loss  
+        branching_loss = self._compute_branching_loss(pred_prob, target)
+        
+        # Combine all losses
+        total_loss = (self.w_dice * dice_loss + 
+                     self.w_cldice * cldice_loss +
+                     self.w_connectivity * connectivity_loss +
+                     self.w_branching * branching_loss)
+        
+        return total_loss
+    
+    def _compute_dice_loss(self, pred, target):
+        """Compute standard Dice loss"""
+        intersection = torch.sum(pred * target)
+        union = torch.sum(pred) + torch.sum(target)
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice
+    
+    def _compute_connectivity_loss(self, pred, target):
+        """
+        Compute connectivity preservation loss
+        Penalizes disconnected components in predicted segmentation
+        """
+        batch_size = pred.shape[0]
+        total_loss = 0.0
+        
+        for b in range(batch_size):
+            pred_np = (pred[b, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+            target_np = (target[b, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+            
+            # Count connected components
+            pred_components = self._count_components(pred_np)
+            target_components = self._count_components(target_np)
+            
+            # Penalize too many components (over-segmentation)
+            if target_components > 0:
+                component_ratio = pred_components / target_components
+                # Loss increases if we have too many components
+                connectivity_loss = max(0, component_ratio - 1.0)
+            else:
+                connectivity_loss = 0.0
+            
+            total_loss += connectivity_loss
+        
+        return total_loss / batch_size
+    
+    def _compute_branching_loss(self, pred, target):
+        """
+        Compute branching point preservation loss
+        Ensures important vessel junction points are preserved
+        """
+        batch_size = pred.shape[0]
+        total_loss = 0.0
+        
+        for b in range(batch_size):
+            pred_np = (pred[b, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+            target_np = (target[b, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+            
+            # Extract skeletons
+            pred_skel = skeletonize(pred_np).astype(np.uint8)
+            target_skel = skeletonize(target_np).astype(np.uint8)
+            
+            # Find branching points (pixels with more than 2 neighbors in skeleton)
+            pred_branch = self._find_branching_points(pred_skel)
+            target_branch = self._find_branching_points(target_skel)
+            
+            # Compute branching point overlap
+            if np.sum(target_branch) > 0:
+                intersection = np.sum(pred_branch * target_branch)
+                union = np.sum(pred_branch) + np.sum(target_branch) - intersection
+                branching_dice = (2.0 * intersection + self.smooth) / (union + 2*intersection + self.smooth)
+                branching_loss = 1 - branching_dice
+            else:
+                branching_loss = 0.0
+            
+            total_loss += branching_loss
+        
+        return total_loss / batch_size
+    
+    def _count_components(self, binary_mask):
+        """Count connected components in binary mask"""
+        if np.sum(binary_mask) == 0:
+            return 0
+        
+        num_labels, _ = cv2.connectedComponents(binary_mask, connectivity=8)
+        return num_labels - 1  # Subtract 1 to exclude background
+    
+    def _find_branching_points(self, skeleton):
+        """
+        Find branching points in skeleton
+        A branching point has more than 2 neighbors
+        """
+        if np.sum(skeleton) == 0:
+            return skeleton
+        
+        # 3x3 kernel for counting neighbors
+        kernel = np.array([[1, 1, 1],
+                          [1, 0, 1], 
+                          [1, 1, 1]], dtype=np.uint8)
+        
+        # Count neighbors for each skeleton pixel
+        neighbor_count = cv2.filter2D(skeleton.astype(np.uint8), -1, kernel)
+        
+        # Branching points have more than 2 neighbors
+        branching_points = (skeleton > 0) & (neighbor_count > 2)
+        
+        return branching_points.astype(np.uint8)

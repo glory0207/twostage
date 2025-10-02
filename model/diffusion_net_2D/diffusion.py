@@ -1,6 +1,7 @@
 import math
 import torch
 from torch import nn, einsum
+import torch.nn.functional as F
 from inspect import isfunction
 from functools import partial
 import numpy as np
@@ -114,6 +115,11 @@ class GaussianDiffusion(nn.Module):
         # 添加更适合局部区域的损失函数
         self.loss_pixelwise = loss.PixelwiseLoss(loss_type='smooth_l1').to(device)
         self.loss_ssim = loss.StructuralSimilarityLoss(window_size=11).to(device)
+        # 添加血管拓扑一致性损失函数
+        self.loss_cldice = loss.CenterlineDiceLoss(alpha=0.5).to(device)
+        self.loss_vessel_topology = loss.VesselTopologyLoss(
+            w_dice=0.4, w_cldice=0.4, w_connectivity=0.1, w_branching=0.1
+        ).to(device)
 
 
     def set_new_noise_schedule(self, schedule_opt, device):
@@ -313,10 +319,65 @@ class GaussianDiffusion(nn.Module):
             # 如果没有地标点，给一个小的正则化损失避免训练崩溃
             l_landmark = l_poly + l_smt
         
-        # 总损失：主要是地标点损失 + 多项式正则化 + 少量平滑
-        loss = l_pix + l_landmark + l_poly + l_smt
+        # 血管拓扑一致性损失（如果有血管分割信息）
+        l_topology = torch.tensor(0.0, device=x_start.device)
+        if 'vessel_seg_moving' in x_in and 'vessel_seg_fixed' in x_in:
+            # 对变形后的移动图像血管分割应用变形场
+            vessel_moving = x_in['vessel_seg_moving']
+            vessel_fixed = x_in['vessel_seg_fixed']
+            
+            # 使用grid_sample对移动图像的血管分割应用变形
+            grid = self._flow_to_grid(flow, (h, w))
+            vessel_moving_warped = F.grid_sample(vessel_moving, grid, mode='bilinear', padding_mode='border', align_corners=True)
+            
+            # 计算血管拓扑一致性损失
+            l_topology = self.loss_vessel_topology(vessel_moving_warped, vessel_fixed, apply_sigmoid=False) * 0.2  # 适中权重
+        
+        # 总损失：主要是地标点损失 + 多项式正则化 + 少量平滑 + 血管拓扑损失
+        loss = l_pix + l_landmark + l_poly + l_smt + l_topology
 
-        return [x_recon, output, flow], [l_pix, l_pixel, l_ssim, l_smt, l_poly, l_landmark, loss]
+        return [x_recon, output, flow], [l_pix, l_pixel, l_ssim, l_smt, l_poly, l_landmark, l_topology, loss]
+
+    def _flow_to_grid(self, flow, image_size):
+        """
+        将变形场转换为grid_sample所需的grid格式
+        
+        Args:
+            flow: 变形场 (B, 2, H, W)
+            image_size: 图像尺寸 (H, W)
+            
+        Returns:
+            grid: 采样网格 (B, H, W, 2)
+        """
+        B, _, H, W = flow.shape
+        
+        # 创建标准网格 [-1, 1]
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=flow.device),
+            torch.linspace(-1, 1, W, device=flow.device),
+            indexing='ij'
+        )
+        # 注意：grid_sample期望的格式是(x, y)，所以先x后y
+        grid = torch.stack([grid_x, grid_y], dim=-1)  # (H, W, 2)
+        grid = grid.unsqueeze(0).expand(B, -1, -1, -1)  # (B, H, W, 2)
+        
+        # 将flow从(B, 2, H, W)转换为(B, H, W, 2)格式
+        # flow[0]是x方向，flow[1]是y方向
+        flow_permuted = flow.permute(0, 2, 3, 1)  # (B, H, W, 2)
+        
+        # 应用变形场到网格
+        # 注意：flow通常是像素级位移，需要归一化到[-1,1]范围
+        # flow的范围通常是像素坐标，需要转换为归一化坐标
+        flow_normalized = flow_permuted.clone()
+        flow_normalized[:, :, :, 0] = 2.0 * flow_permuted[:, :, :, 0] / (W - 1)  # x方向
+        flow_normalized[:, :, :, 1] = 2.0 * flow_permuted[:, :, :, 1] / (H - 1)  # y方向
+        
+        deformed_grid = grid + flow_normalized
+        
+        # 确保grid在有效范围内
+        deformed_grid = torch.clamp(deformed_grid, -1, 1)
+        
+        return deformed_grid
 
     def forward(self, x, *args, **kwargs):
         return self.p_losses(x, *args, **kwargs)
